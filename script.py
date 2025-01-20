@@ -24,7 +24,7 @@ async def check_account(screen_name: str):
     posts = await client.get_user_tweets(user.id, 'Tweets', 1)
     post = posts[0]
 
-    if post.id != lastPost.decode():
+    if lastPost == None or post.id != lastPost.decode():
         thumbnail = None
         if post.media.count:
             thumbnail = {
@@ -52,7 +52,7 @@ async def main():
         accounts = ACCOUNTS.split('||')
         for account in accounts:
             await check_account(account)
-            
+
         print(f'{datetime.now()} | Checked Socials')
         time.sleep(INTERVAL)
 
