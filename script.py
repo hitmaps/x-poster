@@ -24,7 +24,7 @@ async def check_account(screen_name: str):
     posts = await client.get_user_tweets(user.id, 'Tweets', 1)
     post = posts[0]
 
-    if lastPost == None or post.id != lastPost.decode():
+    if lastPost == None or (post.id != lastPost.decode() and post.retweeted_tweet == None):
         thumbnail = None
         if post.media.count:
             thumbnail = {
