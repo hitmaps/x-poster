@@ -26,7 +26,7 @@ async def check_account(screen_name: str):
 
     if lastPost == None or (post.id != lastPost.decode() and post.retweeted_tweet == None):
         thumbnail = None
-        if post.media.count:
+        if post.media != None and post.media.count:
             thumbnail = {
                 'url': post.media[0]['media_url_https']
             }
