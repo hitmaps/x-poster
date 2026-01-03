@@ -19,12 +19,12 @@ client = Client('en-US')
 redisClient = redis.Redis(host=REDIS_HOST, port=REDIS_PORT, password=REDIS_PASSWORD)
 
 async def check_account(screen_name: str):
-    lastPost = redisClient.get(f'x-poster:{screen_name}')
+    lastPosts = redisClient.hkeys(f'x-poster:{screen_name}')
     user = await client.get_user_by_screen_name(screen_name)
     posts = await client.get_user_tweets(user.id, 'Tweets', 1)
     post = posts[0]
 
-    if lastPost == None or (post.id != lastPost.decode() and post.retweeted_tweet == None and post.in_reply_to == None):
+    if not lastPosts or post.id.encode() not in lastPosts and post.retweeted_tweet == None and post.in_reply_to == None:
         thumbnail = None
         if post.media != None and post.media.count:
             thumbnail = {
@@ -43,7 +43,7 @@ async def check_account(screen_name: str):
         }
         requests.post(DISCORD_WEBHOOK, json = data)
 
-        redisClient.set(f'x-poster:{screen_name}', post.id)
+        redisClient.hset(f'x-poster:{screen_name}', post.id, "1")
 
 async def main():
     client.set_cookies({ "auth_token": X_AUTH_TOKEN, "ct0": X_CT0_TOKEN })
