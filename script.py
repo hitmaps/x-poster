@@ -26,6 +26,14 @@ ACCOUNTS = os.environ.get("ACCOUNTS", "hitmapsdotcom||iointeractive||hitman")
 RECONNECT_INITIAL = float(os.environ.get("RECONNECT_INITIAL", "5"))
 RECONNECT_MAX = float(os.environ.get("RECONNECT_MAX", "300"))
 
+# Discord: 10 embeds per webhook message, 1 image each. Webhook file uploads
+# are capped by the destination server (10 MiB unboosted is the safe default).
+DISCORD_MAX_EMBED_IMAGES = 10
+DISCORD_MAX_UPLOAD_BYTES = int(
+    os.environ.get("DISCORD_MAX_UPLOAD_BYTES", str(10 * 1024 * 1024))
+)
+VIDEO_MEDIA_TYPES = {"video", "animated_gif"}
+
 
 def log(message: str) -> None:
     print(f"{datetime.now(timezone.utc).isoformat()} | {message}", flush=True)
@@ -158,34 +166,122 @@ def post_text(tweet: dict[str, Any]) -> str:
     return tweet.get("text") or ""
 
 
-def media_image_url(event_data: dict[str, Any], tweet: dict[str, Any]) -> str | None:
-    """Best-effort first image URL from stream includes or nested media metadata."""
+def attached_media(
+    event_data: dict[str, Any], tweet: dict[str, Any]
+) -> list[dict[str, Any]]:
+    """Media objects for this post, preserving attachment order when keys exist."""
     includes = event_data.get("includes") or {}
     media_list = list(includes.get("media") or [])
-
-    # Some payloads may embed media under payload.attachments expansions style.
-    attachments = tweet.get("attachments") or {}
-    media_keys = set(attachments.get("media_keys") or [])
-
-    for media in media_list:
-        if media_keys and media.get("media_key") not in media_keys:
-            continue
-        if media.get("type") == "photo" and media.get("url"):
-            return media["url"]
-        if media.get("preview_image_url"):
-            return media["preview_image_url"]
-        if media.get("url"):
-            return media["url"]
-
-    # Fall back: any media in includes if keys were missing
+    media_keys = list((tweet.get("attachments") or {}).get("media_keys") or [])
     if not media_keys:
-        for media in media_list:
-            if media.get("type") == "photo" and media.get("url"):
-                return media["url"]
-            if media.get("preview_image_url"):
-                return media["preview_image_url"]
+        return media_list
 
-    return None
+    by_key = {m.get("media_key"): m for m in media_list if m.get("media_key")}
+    ordered = [by_key[k] for k in media_keys if k in by_key]
+    return ordered or media_list
+
+
+def mp4_variant_urls(media: dict[str, Any]) -> list[str]:
+    """MP4 URLs for a video/GIF, highest bitrate first."""
+    variants = list(media.get("variants") or [])
+    mp4s: list[dict[str, Any]] = []
+    for variant in variants:
+        url = variant.get("url")
+        if not url:
+            continue
+        content_type = (variant.get("content_type") or "").lower()
+        path = url.split("?", 1)[0].lower()
+        if content_type == "video/mp4" or path.endswith(".mp4"):
+            mp4s.append(variant)
+    mp4s.sort(key=lambda v: v.get("bit_rate") or v.get("bitrate") or 0, reverse=True)
+    urls = [v["url"] for v in mp4s if v.get("url")]
+
+    direct = media.get("url")
+    if direct and direct not in urls:
+        path = direct.split("?", 1)[0].lower()
+        if path.endswith(".mp4") or media.get("type") in VIDEO_MEDIA_TYPES:
+            urls.append(direct)
+    return urls
+
+
+def fetch_tweet_media(client: httpx.Client, tweet_id: str) -> list[dict[str, Any]]:
+    """Look up media expansions when the stream payload omitted variants/URLs."""
+    resp = client.get(
+        f"{API_BASE}/tweets/{tweet_id}",
+        params={
+            "expansions": "attachments.media_keys",
+            "media.fields": "alt_text,media_key,preview_image_url,type,url,variants",
+        },
+    )
+    if resp.status_code != 200:
+        log(f"Failed to fetch media for post {tweet_id}: {resp.status_code} {resp.text}")
+        return []
+    return list((resp.json().get("includes") or {}).get("media") or [])
+
+
+def post_media(
+    client: httpx.Client, event_data: dict[str, Any], tweet: dict[str, Any]
+) -> tuple[list[str], list[str]]:
+    """
+    Return (photo_urls, video_mp4_urls).
+
+    Video URLs are only returned when the post has no photos, matching X's
+    usual exclusive media types (images vs a single video/GIF).
+    """
+    media_list = attached_media(event_data, tweet)
+    media_keys = list((tweet.get("attachments") or {}).get("media_keys") or [])
+    needs_lookup = bool(media_keys and not media_list)
+    if not needs_lookup:
+        for media in media_list:
+            if media.get("type") in VIDEO_MEDIA_TYPES and not mp4_variant_urls(media):
+                needs_lookup = True
+                break
+
+    if needs_lookup and tweet.get("id"):
+        looked_up = fetch_tweet_media(client, tweet["id"])
+        if looked_up:
+            media_list = attached_media({"includes": {"media": looked_up}}, tweet)
+
+    photo_urls: list[str] = []
+    video_urls: list[str] = []
+    for media in media_list:
+        media_type = media.get("type")
+        if media_type == "photo":
+            url = media.get("url") or media.get("preview_image_url")
+            if url:
+                photo_urls.append(url)
+        elif media_type in VIDEO_MEDIA_TYPES and not video_urls:
+            video_urls = mp4_variant_urls(media)
+
+    if photo_urls:
+        return photo_urls, []
+    return [], video_urls
+
+
+def download_within_limit(
+    client: httpx.Client, url: str, max_bytes: int
+) -> bytes | None:
+    """Download url if it fits max_bytes; otherwise return None."""
+    try:
+        with client.stream("GET", url, follow_redirects=True, timeout=60.0) as resp:
+            if resp.status_code >= 400:
+                log(f"Video download failed: {resp.status_code} {url}")
+                return None
+            length = resp.headers.get("content-length")
+            if length and int(length) > max_bytes:
+                return None
+            chunks: list[bytes] = []
+            total = 0
+            for chunk in resp.iter_bytes():
+                total += len(chunk)
+                if total > max_bytes:
+                    resp.close()
+                    return None
+                chunks.append(chunk)
+            return b"".join(chunks)
+    except httpx.HTTPError as exc:
+        log(f"Video download error: {exc}")
+        return None
 
 
 def resolve_author(
@@ -211,6 +307,45 @@ def resolve_author(
     return username, username
 
 
+def build_discord_embeds(
+    *,
+    display_name: str,
+    username: str,
+    tweet_id: str,
+    text: str,
+    created_at: str | None,
+    image_urls: list[str],
+) -> list[dict[str, Any]]:
+    """One embed per image. Discord groups embeds that share the same url."""
+    post_url = f"https://x.com/{username}/status/{tweet_id}"
+    images = image_urls[:DISCORD_MAX_EMBED_IMAGES]
+    first: dict[str, Any] = {
+        "description": text,
+        "title": f"{display_name} on X",
+        "url": post_url,
+    }
+    if created_at:
+        first["timestamp"] = created_at
+    if images:
+        first["image"] = {"url": images[0]}
+
+    embeds = [first]
+    for image_url in images[1:]:
+        embeds.append({"url": post_url, "image": {"url": image_url}})
+    return embeds
+
+
+def attach_video_for_discord(
+    client: httpx.Client, video_urls: list[str]
+) -> tuple[str, bytes] | None:
+    """Pick the highest-quality MP4 that fits the webhook upload cap."""
+    for url in video_urls:
+        data = download_within_limit(client, url, DISCORD_MAX_UPLOAD_BYTES)
+        if data:
+            return url, data
+    return None
+
+
 def push_to_discord(
     client: httpx.Client,
     *,
@@ -219,23 +354,49 @@ def push_to_discord(
     tweet_id: str,
     text: str,
     created_at: str | None,
-    image_url: str | None,
+    image_urls: list[str],
+    video_urls: list[str],
 ) -> None:
-    embed: dict[str, Any] = {
-        "description": text,
-        "title": f"{display_name} on X",
-        "url": f"https://x.com/{username}/status/{tweet_id}",
-    }
-    if created_at:
-        embed["timestamp"] = created_at
-    if image_url:
-        embed["image"] = {"url": image_url}
+    embeds = build_discord_embeds(
+        display_name=display_name,
+        username=username,
+        tweet_id=tweet_id,
+        text=text,
+        created_at=created_at,
+        image_urls=image_urls,
+    )
+    files: dict[str, tuple[str, bytes, str]] | None = None
 
-    resp = client.post(DISCORD_WEBHOOK, json={"embeds": [embed]})
+    if video_urls and not image_urls:
+        attached = attach_video_for_discord(client, video_urls)
+        if attached:
+            _src_url, video_bytes = attached
+            files = {"files[0]": ("video.mp4", video_bytes, "video/mp4")}
+        else:
+            log(
+                f"Could not attach video under {DISCORD_MAX_UPLOAD_BYTES} bytes "
+                f"for post {tweet_id}; linking instead"
+            )
+            link = video_urls[0]
+            extra = f"\n\n[Video]({link})"
+            description = embeds[0].get("description") or ""
+            embeds[0]["description"] = (description + extra).strip()
+
+    post_url = f"https://x.com/{username}/status/{tweet_id}"
+    if files:
+        resp = client.post(
+            DISCORD_WEBHOOK,
+            data={"payload_json": json.dumps({"embeds": embeds})},
+            files=files,
+            timeout=60.0,
+        )
+    else:
+        resp = client.post(DISCORD_WEBHOOK, json={"embeds": embeds})
+
     if resp.status_code >= 400:
         log(f"Discord webhook failed: {resp.status_code} {resp.text}")
     else:
-        log(f"Posted to Discord: https://x.com/{username}/status/{tweet_id}")
+        log(f"Posted to Discord: {post_url}")
 
 
 def handle_event(
@@ -261,7 +422,7 @@ def handle_event(
 
     display_name, username = resolve_author(tweet, data, users_by_id)
     text = post_text(tweet)
-    image_url = media_image_url(data, tweet)
+    image_urls, video_urls = post_media(client, data, tweet)
 
     push_to_discord(
         client,
@@ -270,7 +431,8 @@ def handle_event(
         tweet_id=tweet["id"],
         text=text,
         created_at=tweet.get("created_at"),
-        image_url=image_url,
+        image_urls=image_urls,
+        video_urls=video_urls,
     )
 
 
