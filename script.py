@@ -26,12 +26,14 @@ ACCOUNTS = os.environ.get("ACCOUNTS", "hitmapsdotcom||iointeractive||hitman")
 RECONNECT_INITIAL = float(os.environ.get("RECONNECT_INITIAL", "5"))
 RECONNECT_MAX = float(os.environ.get("RECONNECT_MAX", "300"))
 
-# Discord: 10 embeds per webhook message, 1 image each. Webhook file uploads
-# are capped by the destination server (10 MiB unboosted is the safe default).
-DISCORD_MAX_EMBED_IMAGES = 10
+# Discord Components V2: 10 media-gallery items per message. Webhook file
+# uploads are capped by the destination server (10 MiB unboosted is safe).
+DISCORD_MAX_GALLERY_ITEMS = 10
 DISCORD_MAX_UPLOAD_BYTES = int(
     os.environ.get("DISCORD_MAX_UPLOAD_BYTES", str(10 * 1024 * 1024))
 )
+DISCORD_IS_COMPONENTS_V2 = 1 << 15
+DISCORD_TEXT_DISPLAY_MAX = 4000
 VIDEO_MEDIA_TYPES = {"video", "animated_gif"}
 
 
@@ -307,34 +309,6 @@ def resolve_author(
     return username, username
 
 
-def build_discord_embeds(
-    *,
-    display_name: str,
-    username: str,
-    tweet_id: str,
-    text: str,
-    created_at: str | None,
-    image_urls: list[str],
-) -> list[dict[str, Any]]:
-    """One embed per image. Discord groups embeds that share the same url."""
-    post_url = f"https://x.com/{username}/status/{tweet_id}"
-    images = image_urls[:DISCORD_MAX_EMBED_IMAGES]
-    first: dict[str, Any] = {
-        "description": text,
-        "title": f"{display_name} on X",
-        "url": post_url,
-    }
-    if created_at:
-        first["timestamp"] = created_at
-    if images:
-        first["image"] = {"url": images[0]}
-
-    embeds = [first]
-    for image_url in images[1:]:
-        embeds.append({"url": post_url, "image": {"url": image_url}})
-    return embeds
-
-
 def attach_video_for_discord(
     client: httpx.Client, video_urls: list[str]
 ) -> tuple[str, bytes] | None:
@@ -344,6 +318,91 @@ def attach_video_for_discord(
         if data:
             return url, data
     return None
+
+
+def discord_execute_url() -> str:
+    url = DISCORD_WEBHOOK
+    if "with_components=" in url:
+        return url
+    return url + ("&" if "?" in url else "?") + "with_components=true"
+
+
+def discord_relative_time(created_at: str | None) -> str:
+    if not created_at:
+        return ""
+    try:
+        dt = datetime.fromisoformat(created_at.replace("Z", "+00:00"))
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return f"-# <t:{int(dt.timestamp())}:R>"
+    except ValueError:
+        return ""
+
+
+def card_text(
+    *,
+    display_name: str,
+    username: str,
+    tweet_id: str,
+    text: str,
+    created_at: str | None,
+) -> str:
+    post_url = f"https://x.com/{username}/status/{tweet_id}"
+    header = f"## [{display_name} on X]({post_url})"
+    footer = discord_relative_time(created_at)
+    body = text or ""
+    overhead = len(header) + (len(footer) + 2 if footer else 0) + (2 if body else 0)
+    budget = DISCORD_TEXT_DISPLAY_MAX - overhead
+    if body and len(body) > budget:
+        body = body[: max(0, budget - 1)] + "…"
+    parts = [header]
+    if body:
+        parts.append(body)
+    if footer:
+        parts.append(footer)
+    return "\n\n".join(parts)
+
+
+def build_post_components(
+    text: str, media_urls: list[str]
+) -> list[dict[str, Any]]:
+    """Same Components V2 card for text, images, and video."""
+    children: list[dict[str, Any]] = [{"type": 10, "content": text}]
+    items = [
+        {"media": {"url": url}}
+        for url in media_urls[:DISCORD_MAX_GALLERY_ITEMS]
+        if url
+    ]
+    if items:
+        children.append({"type": 12, "items": items})
+    return [{"type": 17, "components": children}]
+
+
+def post_discord_payload(
+    client: httpx.Client,
+    *,
+    payload: dict[str, Any],
+    files: dict[str, tuple[str, bytes, str]] | None = None,
+    timeout: float | None = None,
+) -> httpx.Response:
+    kwargs: dict[str, Any] = {}
+    if timeout is not None:
+        kwargs["timeout"] = timeout
+    if files:
+        return client.post(
+            discord_execute_url(),
+            data={"payload_json": json.dumps(payload)},
+            files=files,
+            **kwargs,
+        )
+    return client.post(discord_execute_url(), json=payload, **kwargs)
+
+
+def v2_payload(text: str, media_urls: list[str]) -> dict[str, Any]:
+    return {
+        "flags": DISCORD_IS_COMPONENTS_V2,
+        "components": build_post_components(text, media_urls),
+    }
 
 
 def push_to_discord(
@@ -357,46 +416,42 @@ def push_to_discord(
     image_urls: list[str],
     video_urls: list[str],
 ) -> None:
-    embeds = build_discord_embeds(
+    post_url = f"https://x.com/{username}/status/{tweet_id}"
+    body = card_text(
         display_name=display_name,
         username=username,
         tweet_id=tweet_id,
         text=text,
         created_at=created_at,
-        image_urls=image_urls,
     )
-    files: dict[str, tuple[str, bytes, str]] | None = None
 
-    if video_urls and not image_urls:
+    attempts: list[tuple[list[str], dict[str, tuple[str, bytes, str]] | None]] = []
+    if image_urls:
+        attempts.append((image_urls[:DISCORD_MAX_GALLERY_ITEMS], None))
+    elif video_urls:
         attached = attach_video_for_discord(client, video_urls)
         if attached:
-            _src_url, video_bytes = attached
-            files = {"files[0]": ("video.mp4", video_bytes, "video/mp4")}
-        else:
-            log(
-                f"Could not attach video under {DISCORD_MAX_UPLOAD_BYTES} bytes "
-                f"for post {tweet_id}; linking instead"
+            attempts.append(
+                (
+                    ["attachment://video.mp4"],
+                    {"files[0]": ("video.mp4", attached[1], "video/mp4")},
+                )
             )
-            link = video_urls[0]
-            extra = f"\n\n[Video]({link})"
-            description = embeds[0].get("description") or ""
-            embeds[0]["description"] = (description + extra).strip()
+        attempts.append(([video_urls[0]], None))
+    else:
+        attempts.append(([], None))
 
-    post_url = f"https://x.com/{username}/status/{tweet_id}"
-    if files:
-        resp = client.post(
-            DISCORD_WEBHOOK,
-            data={"payload_json": json.dumps({"embeds": embeds})},
+    for media_urls, files in attempts:
+        resp = post_discord_payload(
+            client,
+            payload=v2_payload(body, media_urls),
             files=files,
-            timeout=60.0,
+            timeout=60.0 if files else None,
         )
-    else:
-        resp = client.post(DISCORD_WEBHOOK, json={"embeds": embeds})
-
-    if resp.status_code >= 400:
+        if resp.status_code < 400:
+            log(f"Posted to Discord: {post_url}")
+            return
         log(f"Discord webhook failed: {resp.status_code} {resp.text}")
-    else:
-        log(f"Posted to Discord: {post_url}")
 
 
 def handle_event(
