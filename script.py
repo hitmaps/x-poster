@@ -111,18 +111,39 @@ def list_subscriptions(client: httpx.Client) -> list[dict[str, Any]]:
     return list((resp.json().get("data") or []))
 
 
-def ensure_post_create_subscriptions(
+def delete_subscription(client: httpx.Client, subscription_id: str) -> None:
+    resp = client.delete(f"{API_BASE}/activity/subscriptions/{subscription_id}")
+    if resp.status_code not in (200, 204):
+        log(
+            f"Failed to delete subscription {subscription_id}: "
+            f"{resp.status_code} {resp.text}"
+        )
+        resp.raise_for_status()
+
+
+def sync_post_create_subscriptions(
     client: httpx.Client, users_by_id: dict[str, dict[str, str]]
 ) -> None:
-    """Create post.create subscriptions for each user if not already present."""
+    """Match post.create subscriptions to ACCOUNTS: create missing, delete extras."""
     existing = list_subscriptions(client)
+    wanted_ids = set(users_by_id.keys())
     already: set[str] = set()
+
     for sub in existing:
-        if sub.get("event_type") != "post.create":
-            continue
-        uid = (sub.get("filter") or {}).get("user_id")
-        if uid:
+        uid = str((sub.get("filter") or {}).get("user_id") or "")
+        sub_id = sub.get("subscription_id") or sub.get("id")
+        event_type = sub.get("event_type")
+        if uid in wanted_ids and event_type == "post.create":
             already.add(uid)
+            continue
+        if uid in wanted_ids:
+            continue
+        if not sub_id:
+            log(f"Skipping subscription with no id: {sub}")
+            continue
+        label = sub.get("tag") or uid or sub_id
+        delete_subscription(client, str(sub_id))
+        log(f"Deleted subscription {label} ({sub_id})")
 
     for user_id, user in users_by_id.items():
         if user_id in already:
@@ -147,6 +168,23 @@ def ensure_post_create_subscriptions(
 def referenced_types(tweet: dict[str, Any]) -> set[str]:
     refs = tweet.get("referenced_tweets") or []
     return {r.get("type") for r in refs if r.get("type")}
+
+
+def event_author_id(tweet: dict[str, Any], event_data: dict[str, Any]) -> str | None:
+    author_id = tweet.get("author_id") or (event_data.get("filter") or {}).get("user_id")
+    if author_id:
+        return str(author_id)
+    return None
+
+
+def is_watched_account(
+    tweet: dict[str, Any],
+    event_data: dict[str, Any],
+    users_by_id: dict[str, dict[str, str]],
+) -> bool:
+    """True when the post author is in this process's ACCOUNTS list."""
+    author_id = event_author_id(tweet, event_data)
+    return bool(author_id and author_id in users_by_id)
 
 
 def should_notify(tweet: dict[str, Any]) -> bool:
@@ -292,7 +330,7 @@ def resolve_author(
     users_by_id: dict[str, dict[str, str]],
 ) -> tuple[str, str]:
     """Return (display_name, username)."""
-    author_id = tweet.get("author_id") or (event_data.get("filter") or {}).get("user_id")
+    author_id = event_author_id(tweet, event_data)
 
     if author_id and author_id in users_by_id:
         u = users_by_id[author_id]
@@ -470,6 +508,11 @@ def handle_event(
         log(f"post.create missing tweet id: {json.dumps(event)[:500]}")
         return
 
+    if not is_watched_account(tweet, data, users_by_id):
+        author_id = event_author_id(tweet, data) or "unknown"
+        log(f"Skipped post {tweet['id']} (author {author_id} not in ACCOUNTS)")
+        return
+
     if not should_notify(tweet):
         types = referenced_types(tweet)
         log(f"Skipped post {tweet['id']} (types={sorted(types) or 'none'})")
@@ -544,7 +587,7 @@ def main() -> None:
         for u in users_by_id.values():
             log(f"Resolved @{u['username']} -> {u['id']} ({u['name']})")
 
-        ensure_post_create_subscriptions(client, users_by_id)
+        sync_post_create_subscriptions(client, users_by_id)
 
         while True:
             try:
